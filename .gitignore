@@ -51,3 +51,9 @@ rsconnect/
 # IDE-specific folders
 .idea/
 **/.ipynb_checkpoints/
+
+# Ignore PyCharm project files
+.idea/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
