@@ -50,3 +50,4 @@ rsconnect/
 
 # IDE-specific folders
 .idea/
+**/.ipynb_checkpoints/
