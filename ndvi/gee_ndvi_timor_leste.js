@@ -1,5 +1,5 @@
 // Load custom ADM2 shapefile for Timor-Leste
-var timor_leste_adm2 = ee.FeatureCollection('projects/ee-spenson/assets/tls_admn_ad2_py_s2_unocha_pp');
+var timor_leste_adm2 = ee.FeatureCollection('projects/ee-spenson/assets/food-security_timor_leste/tls_admn_ad2_py_s2_unocha_pp');
 
 // Center map on Timor-Leste
 Map.centerObject(timor_leste_adm2, 8);
