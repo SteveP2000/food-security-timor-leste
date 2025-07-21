@@ -5,7 +5,9 @@
 // 0. —– Prerequisite —–
 // • Upload your multipolygon asset as an EE FeatureCollection.
 // • Replace this Asset ID if yours is different.
-var regions = ee.FeatureCollection('projects/ee-spenson/assets/food-security-timor-leste/tls_admn_ad2_py_s2_unocha_pp');
+var regions = ee.FeatureCollection(
+  'projects/ee-spenson/assets/food-security-timor-leste/tls_admn_ad2_py_s2_unocha_pp'
+);
 
 // 1. Define the full time window
 var GLOBAL_START = ee.Date('2019-01-01');
