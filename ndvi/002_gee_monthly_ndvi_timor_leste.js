@@ -1,58 +1,49 @@
-// Full GEE script: Extract mean & max monthly NDVI (Jan 2019–Dec 2025) over your Aileu Vila cropland mask,
-// with robust handling of months that have no cloud‐free pixels.
-
-// 0. —– Assets & Settings —–
-var croplandMaskFC = ee.FeatureCollection(
-  'projects/ee-spenson/assets/food-security-timor-leste/LULC_Mean_Probability_Harvest_cropland_mask_aileu_vila'
+// 0. Inputs & Settings
+var adm2FC = ee.FeatureCollection(
+//  'projects/ee-spenson/assets/food-security-timor-leste/LULC_Mean_Probability_Harvest_cropland_mask_adm2'
+  'projects/ee-spenson/assets/food-security-timor-leste/tls_admn_ad2_py_s2_unocha_pp'
 );
-var regionGeom = croplandMaskFC.geometry();
 
 var START_YEAR = 2019;
 var END_YEAR   = 2025;
 
 // 1. Load & cloud‐mask Sentinel-2 SR once (keep only B8 & B4)
 var s2Sr = ee.ImageCollection('COPERNICUS/S2_SR')
-  .filterBounds(regionGeom)
   .map(function(img) {
-    // SCL < 7 = clear
     var clear = img.select('SCL').lt(7);
     return img.updateMask(clear);
   })
-  .select(['B8','B4']);
+  .select(['B8', 'B4']);
 
-// 2. Build server‐side list of month‐start dates
+// 2. Build list of monthly start dates
 var firstOfJan = ee.Date.fromYMD(START_YEAR, 1, 1);
 var firstOfDec = ee.Date.fromYMD(END_YEAR, 12, 1);
 var monthCount = firstOfDec.difference(firstOfJan, 'month').add(1);
 var monthDates = ee.List.sequence(0, monthCount.subtract(1))
-  .map(function(n) {
-    return firstOfJan.advance(n, 'month');
-  });
+  .map(function(n) { return firstOfJan.advance(n, 'month'); });
 
-// 3. Map over each month to compute metrics
-var metricsFC = ee.FeatureCollection(
-  monthDates.map(function(d) {
+// 3. Process each ADM2 feature individually
+adm2FC.aggregate_array('ADM2_PCODE').getInfo().forEach(function(adm2_code) {
+  var feature = adm2FC.filter(ee.Filter.eq('ADM2_PCODE', adm2_code)).first();
+  var regionGeom = ee.Feature(feature).geometry();
+
+  // Compute NDVI metrics per month
+  var metrics = ee.FeatureCollection(monthDates.map(function(d) {
     d = ee.Date(d);
     var year  = d.get('year');
     var month = d.get('month');
     var start = d;
     var end   = start.advance(1, 'month').advance(-1, 'second');
-    
-    // Filter to this month and region
-    var col = s2Sr
-      .filterDate(start, end)
-      .filterBounds(regionGeom);
-    
-    // Compute NDVI per image
+
+    var col = s2Sr.filterDate(start, end).filterBounds(regionGeom);
+
     var ndviCol = col.map(function(img) {
-      return img.normalizedDifference(['B8','B4']).rename('NDVI');
+      return img.normalizedDifference(['B8', 'B4']).rename('NDVI');
     });
-    
-    // Mean & max composites
+
     var meanImg = ndviCol.mean();
     var maxImg  = ndviCol.max();
-    
-    // Reduce over the cropland mask
+
     var meanDict = meanImg.reduceRegion({
       reducer:   ee.Reducer.mean(),
       geometry:  regionGeom,
@@ -60,6 +51,7 @@ var metricsFC = ee.FeatureCollection(
       maxPixels: 1e13,
       tileScale: 4
     });
+
     var maxDict = maxImg.reduceRegion({
       reducer:   ee.Reducer.max(),
       geometry:  regionGeom,
@@ -67,8 +59,7 @@ var metricsFC = ee.FeatureCollection(
       maxPixels: 1e13,
       tileScale: 4
     });
-    
-    // Safely extract NDVI, or null if no pixels
+
     var meanVal = ee.Algorithms.If(
       ee.Dictionary(meanDict).contains('NDVI'),
       ee.Dictionary(meanDict).get('NDVI'),
@@ -79,25 +70,22 @@ var metricsFC = ee.FeatureCollection(
       ee.Dictionary(maxDict).get('NDVI'),
       null
     );
-    
-    // Return a feature for this month
+
     return ee.Feature(null, {
+      ADM2_PCODE: adm2_code,
       year:       year,
       month:      month,
       mean_NDVI:  meanVal,
       max_NDVI:   maxVal
     });
-  })
-);
+  }));
 
-// 4. QA: print first few rows
-print('Monthly NDVI metrics:', metricsFC.limit(12));
-
-// 5. Export as CSV
-Export.table.toDrive({
-  collection:     metricsFC,
-  description:    'AileuVila_Cropland_NDVI_MonthlyMetrics',
-  fileNamePrefix: 'AileuVila_NDVI_Monthly',
-  folder:         'EarthEngineExports',
-  fileFormat:     'CSV'
+  // Export each region’s results as a separate CSV
+  Export.table.toDrive({
+    collection:     metrics,
+    description:    'NDVI_MonthlyMetrics_' + adm2_code,
+    fileNamePrefix: adm2_code + '_NDVI_Monthly_full',
+    folder:         'EarthEngineExports/NDVI_TIMOR_ADM2',
+    fileFormat:     'CSV'
+  });
 });

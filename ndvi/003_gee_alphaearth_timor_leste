@@ -1,0 +1,86 @@
+// ======================================
+// Export Year-to-Year Change-Score Rasters (Fixed Rename)
+// ======================================
+
+// 1. Load your study area
+var studyArea = ee.FeatureCollection(
+  'projects/ee-spenson/assets/food-security-timor-leste/seloi_craic_rice_agricultural_area'
+);
+Map.centerObject(studyArea, 12);
+Map.addLayer(studyArea, {color: 'blue'}, 'Study Area');
+
+// 2. Load the annual embedding collection over your area
+var embeddings = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+                    .filterBounds(studyArea);
+
+// 3. Get the list of available years (server-side)
+var years = ee.List(
+  embeddings
+    .aggregate_array('system:time_start')
+    .map(function(ms) { return ee.Date(ms).get('year'); })
+)
+.distinct()
+.sort();
+
+// 4. Build startYears/endYears lists
+var startYears = years.slice(0, years.size().subtract(1));
+var endYears   = years.slice(1);
+
+// 5. Compute a single-band "change" image for each consecutive year pair
+var changeCollection = ee.ImageCollection(
+  ee.List.sequence(0, startYears.size().subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var y1 = ee.Number(startYears.get(i));
+    var y2 = ee.Number(endYears.get(i));
+    
+    var img1 = embeddings
+      .filterDate(ee.Date.fromYMD(y1, 1, 1),
+                  ee.Date.fromYMD(y1.add(1), 1, 1))
+      .first();
+    var img2 = embeddings
+      .filterDate(ee.Date.fromYMD(y2, 1, 1),
+                  ee.Date.fromYMD(y2.add(1), 1, 1))
+      .first();
+    
+    // Dot-product → similarity → invert to change
+    var change = img1.multiply(img2)
+                     .reduce(ee.Reducer.sum())
+                     .multiply(-1)
+                     .add(1)
+                     .rename('change')        // single, fixed band name
+                     .set('year1', y1)
+                     .set('year2', y2);
+    return change;
+  })
+);
+
+// 6. Turn the collection into a client-side list
+var changeList = changeCollection.toList(changeCollection.size());
+var listClient = changeList.getInfo();  // now a JS array
+
+// 7. Loop over year-pairs: map & export
+listClient.forEach(function(item) {
+  var img    = ee.Image(item.id);
+  var year1  = item.properties.year1;
+  var year2  = item.properties.year2;
+  var title  = year1 + '→' + year2 + ' change';
+  var prefix = 'change_' + year1 + '_' + year2;
+  
+  // a) Add to map
+  Map.addLayer(
+    img.clip(studyArea),
+    {min: 0, max: 1, palette: ['white','red']},
+    title
+  );
+  
+  // b) Schedule export (single band "change")
+  Export.image.toDrive({
+    image:          img.clip(studyArea),
+    description:    prefix,
+    folder:         'EarthEngineExports',
+    fileNamePrefix: prefix,
+    region:         studyArea.geometry(),
+    scale:          30,
+    maxPixels:      1e13
+  });
+});
