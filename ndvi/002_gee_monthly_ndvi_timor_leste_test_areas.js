@@ -3,12 +3,12 @@
 
 // 0. Inputs & Settings
 var assetId       = 
-//    'projects/ee-spenson/assets/food-security-timor-leste/maliana_rice_agricultural_area'
+    'projects/ee-spenson/assets/food-security-timor-leste/maliana_rice_agricultural_area'
 //    'projects/ee-spenson/assets/food-security-timor-leste/triloka_acid_soil_area'
 //    'projects/ee-spenson/assets/food-security-timor-leste/caibada_alkaline_soil_area'
 //    'projects/ee-spenson/assets/food-security-timor-leste/darasula_research_station_area'
 //    'projects/ee-spenson/assets/food-security-timor-leste/fatumaca_research_station_area'
-    'projects/ee-spenson/assets/food-security-timor-leste/natarbora_neutral_soil_area'
+//    'projects/ee-spenson/assets/food-security-timor-leste/natarbora_neutral_soil_area'
 ;
 
 var assetName     = assetId.split('/').pop();  // "maliana_rice_agricultural_area"
