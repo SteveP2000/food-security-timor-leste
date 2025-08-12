@@ -1,0 +1,184 @@
+// ----------------------------------------------
+// Per-ADM2 yearly change exports (NDVI/EVI) + Greening masks
+// SCL + MSK_CLDPRB mask, correct EVI scaling, safe band names,
+// batched tasks, all-float exports, and per-year & summary greening masks.
+// ----------------------------------------------
+
+var adm2FC = ee.FeatureCollection(
+  'projects/ee-spenson/assets/food-security-timor-leste/LULC_Mean_Probability_Harvest_cropland_mask_adm2'
+);
+
+var START_YEAR      = 2019;
+var END_YEAR        = 2025;
+var BASELINE_YEARS  = [2019, 2020, 2021];
+var YEARS           = ee.List.sequence(START_YEAR, END_YEAR);
+
+// Greening mask thresholds (tune as needed)
+var CHANGE_THR = 0.05; // require +0.05 above baseline
+var MIN_COUNT  = 3;    // require ≥3 clear scenes in the year
+
+// ---------- Sentinel-2 preprocessing ----------
+function maskS2(img) {
+  // Keep clear SCL classes (4=veg, 5=bare, 6=water, 11=snow/ice)
+  var scl = img.select('SCL');
+  var clearSCL = scl.eq(4).or(scl.eq(5)).or(scl.eq(6)).or(scl.eq(11));
+  // Built-in cloud probability (0..100)
+  var cldProb = img.select('MSK_CLDPRB');
+  var clearProb = cldProb.lt(40); // tighten/loosen if needed
+  return img.updateMask(clearSCL).updateMask(clearProb);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .select(['B8','B4','B2','SCL','MSK_CLDPRB'])
+  .map(maskS2);
+
+// ---------- Indices with reflectance scaling fix ----------
+function ndviFrom(img) {
+  var nir = img.select('B8').multiply(0.0001);
+  var red = img.select('B4').multiply(0.0001);
+  return nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+}
+function eviFrom(img) {
+  var nir  = img.select('B8').multiply(0.0001);
+  var red  = img.select('B4').multiply(0.0001);
+  var blue = img.select('B2').multiply(0.0001);
+  return nir.subtract(red).multiply(2.5)
+            .divide(nir.add(red.multiply(6)).subtract(blue.multiply(7.5)).add(1))
+            .rename('EVI');
+}
+
+function yearCol(y, geom) {
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = start.advance(1, 'year');
+  return s2.filterDate(start, end).filterBounds(geom);
+}
+
+// Short, safe names for Tasks panel
+function safeName(str, maxLen) {
+  str = (str || '').toString().replace(/[^A-Za-z0-9_-]/g, '_');
+  if (str.length > maxLen) str = str.slice(0, maxLen);
+  return str;
+}
+
+// ---------- Build the multiband export image for one ADM2 ----------
+function buildExportImageForADM2(adm2_code) {
+  var subset = adm2FC.filter(ee.Filter.eq('ADM2_PCODE', adm2_code));
+  var feat   = subset.first();
+  var region = ee.Feature(feat).geometry();
+
+  // Per-ADM2 cropland mask: burn constant 1 into polygons -> binary mask
+  var cropMask = ee.Image().byte().paint(subset, 1).selfMask();
+
+  // Annual peak NDVI/EVI and per-pixel count (one image per year in an IC)
+  var yearlyPeakIC = ee.ImageCollection(
+    YEARS.map(function(y) {
+      y = ee.Number(y);
+      var col   = yearCol(y, region);
+      var ndIC  = col.map(ndviFrom).map(function(im){ return im.updateMask(cropMask); });
+      var evIC  = col.map(eviFrom ).map(function(im){ return im.updateMask(cropMask); });
+
+      var ndPeak = ndIC.max().rename('NDVIp');
+      var evPeak = evIC.max().rename('EVIp');
+      var cnt    = ndIC.count().rename('CNT');
+
+      // Letter-prefixed index so toBands() makes valid names (e.g., Y2019)
+      var idx = ee.String('Y').cat(ee.Number(y).format('%.0f'));
+
+      return ee.Image.cat(ndPeak, evPeak, cnt)
+        .set('year', y)
+        .set('system:index', idx)
+        .set('system:time_start', ee.Date.fromYMD(y,1,1).millis())
+        .clip(region);
+    })
+  );
+
+  // Baseline (mean of peaks over baseline years) -> float
+  var baseIC   = yearlyPeakIC.filter(ee.Filter.inList('year', BASELINE_YEARS));
+  var ndviBase = baseIC.select('NDVIp').mean().rename('NDVIp_base').toFloat();
+  var eviBase  = baseIC.select('EVIp').mean().rename('EVIp_base').toFloat();
+
+  // Deltas vs baseline (per year), keep same safe index for toBands()
+  var deltaIC = yearlyPeakIC.map(function(img) {
+    var dNdvi = img.select('NDVIp').subtract(ndviBase).rename('dNDVI');
+    var dEvi  = img.select('EVIp').subtract(eviBase).rename('dEVI');
+    return ee.Image.cat(dNdvi, dEvi)
+      .set('system:index', img.get('system:index'));
+  });
+
+  // Stack per-year bands (cast each stack to float)
+  var ndviPeakBands = yearlyPeakIC.select('NDVIp').toBands().toFloat(); // Y2019_NDVIp, ...
+  var eviPeakBands  = yearlyPeakIC.select('EVIp').toBands().toFloat();  // Y2019_EVIp, ...
+  var cntBands      = yearlyPeakIC.select('CNT').toBands().toFloat();   // Y2019_CNT, ...
+  var dNdviBands    = deltaIC.select('dNDVI').toBands().toFloat();      // Y2019_dNDVI, ...
+  var dEviBands     = deltaIC.select('dEVI').toBands().toFloat();       // Y2019_dEVI, ...
+
+  // ---------- Greening masks (strict: ΔEVI>thr & ΔNDVI>thr & CNT≥min) ----------
+  function greenMaskForYear(y) {
+    var ys = 'Y' + y;
+    var dE = dEviBands.select(ys + '_dEVI').gt(CHANGE_THR);
+    var dN = dNdviBands.select(ys + '_dNDVI').gt(CHANGE_THR);
+    var c  = cntBands.select(ys + '_CNT').gte(MIN_COUNT);
+    return dE.and(dN).and(c).rename(ys + '_GREEN').toFloat();
+  }
+  var g22 = greenMaskForYear(2022);
+  var g23 = greenMaskForYear(2023);
+  var g24 = greenMaskForYear(2024);
+  var g25 = greenMaskForYear(2025);
+
+  var greenAny = g22.add(g23).add(g24).add(g25)
+                    .gt(0).rename('GREEN_any_2022_2025').toFloat();
+  var greenPersist = g22.add(g23).add(g24).add(g25)
+                        .gte(2).rename('GREEN_persist_ge2_2022_2025').toFloat();
+
+  var greenStack = ee.Image.cat([g22, g23, g24, g25, greenAny, greenPersist]).toFloat();
+
+  // Final multiband image (all float32)
+  return ee.Image.cat(
+           ndviPeakBands, eviPeakBands, cntBands,
+           ndviBase, eviBase,
+           dNdviBands, dEviBands,
+           greenStack
+         )
+         .updateMask(cropMask)
+         .clip(region)
+         .toFloat();
+}
+
+// ---------- Queue tasks (batched) ----------
+var BATCH_SIZE = 30;  // lower if the Tasks panel is fragile
+
+adm2FC.aggregate_array('ADM2_PCODE').evaluate(function(codes) {
+  if (!codes || !codes.length) {
+    print('No ADM2_PCODE values found.');
+    return;
+  }
+
+  // For testing: codes = codes.slice(0, 10);
+
+  print('Preparing', codes.length, 'ADM2 exports… Open the Tasks tab.');
+
+  for (var i = 0; i < codes.length; i += BATCH_SIZE) {
+    var batch = codes.slice(i, Math.min(i + BATCH_SIZE, codes.length));
+
+    batch.forEach(function(codeRaw) {
+      var code = safeName(codeRaw, 40);
+      var desc = safeName('NDVI_EVI_GREEN_' + code, 60);
+      var fn   = safeName(code + '_NDVI_EVI_GREEN_2019_2025', 80);
+
+      var outImage = buildExportImageForADM2(codeRaw);
+      var region   = adm2FC.filter(ee.Filter.eq('ADM2_PCODE', codeRaw)).geometry();
+
+      Export.image.toDrive({
+        image:         outImage,
+        description:   desc,
+        fileNamePrefix: fn,
+        folder:        'NDVI_Change_TIMOR_ADM2',
+        region:        region,
+        scale:         10,
+        maxPixels:     1e13
+      });
+    });
+
+    print('Queued batch', (i / BATCH_SIZE) + 1, 'with', batch.length, 'tasks.');
+  }
+});
