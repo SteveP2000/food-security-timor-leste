@@ -8,7 +8,7 @@
 
 // 0) Inputs & Settings
 var adm2FC = ee.FeatureCollection(
-  'projects/ee-spenson/assets/food-security-timor-leste/LULC_Mean_Probability_Harvest_cropland_mask_adm2'
+  'projects/ee-spenson/assets/food-security-timor-leste/LULC_Mean_Probability_Harvest_cropland_mask_adm2_v2'
 );
 var START_YEAR = 2019;
 var END_YEAR   = 2025;
