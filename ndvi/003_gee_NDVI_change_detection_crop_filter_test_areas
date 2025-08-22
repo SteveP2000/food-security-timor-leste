@@ -36,8 +36,8 @@ var EVI_CLAMP_MIN   = 0.30, EVI_CLAMP_MAX  = 0.50;
 var CHANGE_THR      = 0.01;       // Δ>0.01 ~ small but real increase
 var PERSIST_MIN_YRS = 2;          // years required (of 2022–2025) for persistent greening
 
-// ===== S2 preprocessing (join S2_SR with s2cloudless; SCL + cloud prob masking) =====
-var s2sr = ee.ImageCollection('COPERNICUS/S2_SR')
+// ===== S2 preprocessing (join Harmonized S2_SR with s2cloudless; SCL + cloud prob masking) =====
+var s2harmSR = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterBounds(REGION)
   .filterDate(ee.Date.fromYMD(START_YEAR,1,1), ee.Date.fromYMD(END_YEAR,12,31).advance(1,'day'));
 
@@ -47,7 +47,7 @@ var s2cp = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
 
 // Join by granule id
 var s2_joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply({
-  primary: s2sr,
+  primary: s2harmSR,
   secondary: s2cp,
   condition: ee.Filter.equals({
     leftField: 'system:index',

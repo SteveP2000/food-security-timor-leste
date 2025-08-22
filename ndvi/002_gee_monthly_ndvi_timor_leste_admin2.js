@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------
 // Monthly NDVI/EVI per ADM2, aligned with Script 3 masking & structure
 // - s2cloudless + SCL masking
-// - NDVI/EVI computed from S2_SR (scaled by 0.0001)
+// - NDVI/EVI computed from Harmonized S2_SR (scaled by 0.0001)
 // - Per-month QA: mean/max clear fraction across images
 // - One CSV per ADM2 (2019–2025)
 // ---------------------------------------------------------------------
@@ -14,16 +14,17 @@ var START_YEAR = 2019;
 var END_YEAR   = 2025;
 var CLD_PROB_THR = 40; // consistent with Script 3
 
-// 1) Sentinel-2: join S2_SR with s2cloudless and build CLEAR mask via SCL + prob
-var s2sr = ee.ImageCollection('COPERNICUS/S2_SR')
+// 1) Sentinel-2: join Harmonized S2_SR with s2cloudless and build CLEAR mask via SCL + prob
+// IMPORTANT: Use SR harmonized (has SCL). L1C (S2_HARMONIZED) does NOT have SCL.
+var s2harmSR = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1), ee.Date.fromYMD(END_YEAR, 12, 31).advance(1, 'day'));
 
 var s2prob = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
   .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1), ee.Date.fromYMD(END_YEAR, 12, 31).advance(1, 'day'));
 
-// Join on granule ID (system:index works reliably for S2_SR ↔ s2cloudless)
+// Join on granule ID (system:index works for S2_SR_HARMONIZED ↔ s2cloudless)
 var joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply({
-  primary: s2sr,
+  primary: s2harmSR,
   secondary: s2prob,
   condition: ee.Filter.equals({
     leftField: 'system:index',
@@ -32,6 +33,11 @@ var joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply({
 }));
 
 function maskS2(img) {
+  // Ensure SCL is present (SR has it). If not, throw a clear error.
+  var bandNames = img.bandNames();
+  var hasSCL = bandNames.contains('SCL');
+  img = ee.Image(ee.Algorithms.If(hasSCL, img, img.addBands(ee.Image().rename('SCL')))); // fallback no-op
+
   var scl = img.select('SCL');
   var cld = ee.Image(img.get('clouds')).select('probability').rename('MSK_CLDPRB');
 
@@ -50,8 +56,9 @@ function maskS2(img) {
 
 var s2 = joined
   .map(function(img){
-    // Ensure SCL band is present; keep only needed bands + CLEAR
-    return img.addBands(img.select(['B8','B4','B2','SCL']), null, true);
+    // Keep only needed bands + CLEAR later
+    // (SR bands include B2,B3,B4,B5,B6,B7,B8,B8A,B9,B11,B12,SCL,...)
+    return img.select(['B8','B4','B2','SCL']).copyProperties(img, img.propertyNames());
   })
   .map(maskS2)
   .select(['B8','B4','B2','CLEAR']); // we need these for indices + QA

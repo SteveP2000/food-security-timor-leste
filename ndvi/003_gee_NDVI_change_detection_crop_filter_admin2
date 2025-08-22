@@ -2,6 +2,7 @@
 // NDVI/EVI peaks, baseline deltas, + ADAPTIVE dynamic viability
 // Updated "GREENER" methodology: only identify INCREASE vs baseline,
 // with both "any-index increase" (OR) and "joint increase" (AND) outputs.
+// Uses HARMONIZED Sentinel-2 SR to ensure consistency across baseline 04.00+
 // -----------------------------------------------------------
 
 var adm2FC = ee.FeatureCollection(
@@ -28,9 +29,11 @@ var PERSIST_MIN_YRS = 2;          // years required (of 2022–2025) for persist
 
 var BATCH_SIZE      = 25;         // task batching
 
-// ===== S2 preprocessing (join S2_SR with s2cloudless; SCL + cloud prob masking) =====
+// ===== S2 preprocessing (join HARMONIZED S2_SR with s2cloudless; SCL + cloud prob masking) =====
 var fullGeom = adm2FC.geometry();
-var s2sr  = ee.ImageCollection('COPERNICUS/S2_SR')
+
+// IMPORTANT: switch to Harmonized collection to avoid the 2022 baseline DN shift
+var s2harm = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterBounds(fullGeom)
   .filterDate(ee.Date.fromYMD(START_YEAR,1,1), ee.Date.fromYMD(END_YEAR,12,31).advance(1,'day'));
 
@@ -38,9 +41,9 @@ var s2cp  = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
   .filterBounds(fullGeom)
   .filterDate(ee.Date.fromYMD(START_YEAR,1,1), ee.Date.fromYMD(END_YEAR,12,31).advance(1,'day'));
 
-// Join by granule id
+// Join by granule id (system:index matches between S2 and cloud-probability granules)
 var s2_joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply({
-  primary: s2sr,
+  primary: s2harm,
   secondary: s2cp,
   condition: ee.Filter.equals({
     leftField: 'system:index',

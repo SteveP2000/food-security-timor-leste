@@ -2,7 +2,7 @@
 // Monthly NDVI/EVI for a single AOI (no ADM2_PCODE)
 // - AOI: projects/ee-spenson/assets/food-security-timor-leste/seloi_craic_rice_agricultural_area
 // - s2cloudless + SCL masking (keep 4/5/6[/11])
-// - NDVI/EVI from S2_SR (scaled by 0.0001)
+// - NDVI/EVI from Harmonized S2_SR (scaled by 0.0001)
 // - Per-month QA: mean/max clear fraction across images
 // - Single CSV export (2019–2025)
 // ---------------------------------------------------------------------
@@ -10,12 +10,12 @@
 // 0) Inputs & Settings
 var ASSET_ID = 
     'projects/ee-spenson/assets/food-security-timor-leste/seloi_craic_rice_agricultural_area'
-//    'projects/ee-spenson/assets/food-security-timor-leste/maliana_rice_agricultural_area'
-//    'projects/ee-spenson/assets/food-security-timor-leste/triloka_acid_soil_area'
-//    'projects/ee-spenson/assets/food-security-timor-leste/caibada_alkaline_soil_area'
-//    'projects/ee-spenson/assets/food-security-timor-leste/darasula_research_station_area'
-//    'projects/ee-spenson/assets/food-security-timor-leste/fatumaca_research_station_area'
-//    'projects/ee-spenson/assets/food-security-timor-leste/natarbora_neutral_soil_area'
+//  'projects/ee-spenson/assets/food-security-timor-leste/maliana_rice_agricultural_area'
+//  'projects/ee-spenson/assets/food-security-timor-leste/triloka_acid_soil_area'
+//  'projects/ee-spenson/assets/food-security-timor-leste/caibada_alkaline_soil_area'
+//  'projects/ee-spenson/assets/food-security-timor-leste/darasula_research_station_area'
+//  'projects/ee-spenson/assets/food-security-timor-leste/fatumaca_research_station_area'
+//  'projects/ee-spenson/assets/food-security-timor-leste/natarbora_neutral_soil_area'
   ;
 var REGION_NAME = ASSET_ID.split('/').pop();
 
@@ -26,8 +26,8 @@ var START_YEAR = 2019;
 var END_YEAR   = 2025;
 var CLD_PROB_THR = 40; // consistent with v2/script 3
 
-// 1) Sentinel-2: join S2_SR with s2cloudless and build CLEAR mask via SCL + prob
-var s2sr = ee.ImageCollection('COPERNICUS/S2_SR')
+// 1) Sentinel-2: join Harmonized S2_SR with s2cloudless and build CLEAR mask via SCL + prob
+var s2harmSR = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterBounds(regionGeom)
   .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1), ee.Date.fromYMD(END_YEAR, 12, 31).advance(1, 'day'));
 
@@ -35,9 +35,9 @@ var s2prob = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
   .filterBounds(regionGeom)
   .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1), ee.Date.fromYMD(END_YEAR, 12, 31).advance(1, 'day'));
 
-// Join on granule ID (system:index works for S2_SR ↔ s2cloudless)
+// Join on granule ID (system:index works for S2_SR_HARMONIZED ↔ s2cloudless)
 var joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply({
-  primary: s2sr,
+  primary: s2harmSR,
   secondary: s2prob,
   condition: ee.Filter.equals({
     leftField: 'system:index',
