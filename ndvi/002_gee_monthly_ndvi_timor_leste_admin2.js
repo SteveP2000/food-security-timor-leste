@@ -1,87 +1,78 @@
 // ---------------------------------------------------------------------
-// Monthly NDVI/EVI per ADM2, aligned with Script 3 masking & structure
-// - s2cloudless + SCL masking
-// - NDVI/EVI computed from Harmonized S2_SR (scaled by 0.0001)
-// - Per-month QA: mean/max clear fraction across images
-// - One CSV per ADM2 (2019–2025)
+// Monthly NDVI/EVI per ADM2 (FAST VERSION)
+// - Harmonized S2_SR + s2cloudless (inner join)
+// - Precompute NDVI/EVI once; monthly CLEAR QA from temporal reducers
+// - Single reduceRegion per month for NDVI/EVI and one for CLEAR QA
 // ---------------------------------------------------------------------
 
 // 0) Inputs & Settings
 var adm2FC = ee.FeatureCollection(
   'projects/ee-spenson/assets/food-security-timor-leste/LULC_Mean_Probability_Harvest_cropland_mask_adm2_v2'
+//  'projects/ee-spenson/assets/food-security-timor-leste/LULC_Impact_Observatory_cropland_mask_adm2'  
 );
 var START_YEAR = 2019;
 var END_YEAR   = 2025;
-var CLD_PROB_THR = 40; // consistent with Script 3
+var CLD_PROB_THR = 40;     // consistent with Script 3
+var REDUCE_SCALE = 20;     // faster + consistent with SCL native resolution
 
-// 1) Sentinel-2: join Harmonized S2_SR with s2cloudless and build CLEAR mask via SCL + prob
-// IMPORTANT: Use SR harmonized (has SCL). L1C (S2_HARMONIZED) does NOT have SCL.
+// 1) Sentinel-2: robust inner join (every image has cloud prob)
 var s2harmSR = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-  .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1), ee.Date.fromYMD(END_YEAR, 12, 31).advance(1, 'day'));
+  .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1),
+              ee.Date.fromYMD(END_YEAR,   12, 31).advance(1, 'day'));
 
 var s2prob = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
-  .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1), ee.Date.fromYMD(END_YEAR, 12, 31).advance(1, 'day'));
+  .filterDate(ee.Date.fromYMD(START_YEAR, 1, 1),
+              ee.Date.fromYMD(END_YEAR,   12, 31).advance(1, 'day'));
 
-// Join on granule ID (system:index works for S2_SR_HARMONIZED ↔ s2cloudless)
-var joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply({
+var innerJoined = ee.Join.inner().apply({
   primary: s2harmSR,
   secondary: s2prob,
   condition: ee.Filter.equals({
-    leftField: 'system:index',
+    leftField:  'system:index',
     rightField: 'system:index'
   })
+});
+
+// Attach MSK_CLDPRB and keep only needed bands early
+var withCloudProb = ee.ImageCollection(innerJoined.map(function(pair) {
+  var s2  = ee.Image(pair.get('primary'));
+  var cp  = ee.Image(pair.get('secondary')).select('probability').rename('MSK_CLDPRB');
+  return s2.addBands(cp).select(['B8','B4','B2','SCL','MSK_CLDPRB']);
 }));
 
+// Mask function
 function maskS2(img) {
-  // Ensure SCL is present (SR has it). If not, throw a clear error.
-  var bandNames = img.bandNames();
-  var hasSCL = bandNames.contains('SCL');
-  img = ee.Image(ee.Algorithms.If(hasSCL, img, img.addBands(ee.Image().rename('SCL')))); // fallback no-op
-
   var scl = img.select('SCL');
-  var cld = ee.Image(img.get('clouds')).select('probability').rename('MSK_CLDPRB');
+  var clearSCL  = scl.eq(4).or(scl.eq(5)).or(scl.eq(6)).or(scl.eq(11)); // veg, bare, water, snow/ice
+  var clearProb = img.select('MSK_CLDPRB').lt(CLD_PROB_THR);
+  var masked = img.updateMask(clearSCL).updateMask(clearProb);
 
-  // Keep SCL 4 (veg), 5 (bare), 6 (water); optionally include 11 (snow/ice)
-  var keepSCL  = scl.eq(4).or(scl.eq(5)).or(scl.eq(6)).or(scl.eq(11));
-  var keepProb = cld.lt(CLD_PROB_THR);
-
-  // Apply masks to all bands
-  var masked = img.updateMask(keepSCL).updateMask(keepProb);
-
-  // CLEAR = 1 where valid (unmasked), masked elsewhere
+  // CLEAR = 1 where valid; masked elsewhere
   var clear = ee.Image(1).updateMask(masked.mask().reduce(ee.Reducer.min())).rename('CLEAR');
-
   return masked.addBands(clear);
 }
 
-var s2 = joined
-  .map(function(img){
-    // Keep only needed bands + CLEAR later
-    // (SR bands include B2,B3,B4,B5,B6,B7,B8,B8A,B9,B11,B12,SCL,...)
-    return img.select(['B8','B4','B2','SCL']).copyProperties(img, img.propertyNames());
-  })
-  .map(maskS2)
-  .select(['B8','B4','B2','CLEAR']); // we need these for indices + QA
-
-// 2) Helpers: monthly dates + indices
-var firstOfJan = ee.Date.fromYMD(START_YEAR, 1, 1);
-var monthCount = ee.Date.fromYMD(END_YEAR, 12, 1).difference(firstOfJan, 'month').add(1);
-var monthDates = ee.List.sequence(0, monthCount.subtract(1))
-  .map(function(n) { return firstOfJan.advance(n, 'month'); });
-
-function ndviFrom(img) {
-  var nir = img.select('B8').multiply(0.0001);
-  var red = img.select('B4').multiply(0.0001);
-  return nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-}
-function eviFrom(img) {
+// Precompute NDVI/EVI once
+function addIndices(img) {
   var nir  = img.select('B8').multiply(0.0001);
   var red  = img.select('B4').multiply(0.0001);
   var blue = img.select('B2').multiply(0.0001);
-  return nir.subtract(red).multiply(2.5)
-            .divide(nir.add(red.multiply(6)).subtract(blue.multiply(7.5)).add(1))
-            .rename('EVI');
+  var ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+  var evi  = nir.subtract(red).multiply(2.5)
+               .divide(nir.add(red.multiply(6)).subtract(blue.multiply(7.5)).add(1))
+               .rename('EVI');
+  return img.addBands([ndvi, evi]);
 }
+
+// Final working collection: NDVI, EVI, CLEAR only
+var S2 = withCloudProb.map(maskS2).map(addIndices).select(['NDVI','EVI','CLEAR']);
+
+// 2) Helpers: monthly dates
+var firstOfJan = ee.Date.fromYMD(START_YEAR, 1, 1);
+var monthCount = ee.Date.fromYMD(END_YEAR, 12, 1)
+                  .difference(firstOfJan, 'month').add(1);
+var monthDates = ee.List.sequence(0, monthCount.subtract(1))
+  .map(function(n) { return firstOfJan.advance(n, 'month'); });
 
 // 3) Per-ADM2 processing & export (batched via evaluate)
 adm2FC.aggregate_array('ADM2_PCODE').evaluate(function(codes) {
@@ -99,84 +90,55 @@ adm2FC.aggregate_array('ADM2_PCODE').evaluate(function(codes) {
         var end     = d.advance(1, 'month');
         var dateStr = d.format('YYYY-MM-dd');
 
-        // Monthly S2 subset over region
-        var col = s2.filterDate(start, end).filterBounds(regionGeom);
+        // Monthly subset
+        var col   = S2.filterDate(start, end).filterBounds(regionGeom);
         var count = col.size();
 
-        // Attach per-image CLEAR fraction over the region (unmask 0 → includes cloudy area)
-        var colWithCF = col.map(function(img) {
-          var cf = img.select('CLEAR').unmask(0).reduceRegion({
-            reducer:  ee.Reducer.mean(),
-            geometry: regionGeom,
-            scale:    20,
-            maxPixels:1e13,
-            tileScale:4
-          }).get('CLEAR');
-          return img.set('clearFrac', cf);
+        // ---- NDVI/EVI: build 4-band monthly image, reduce once
+        var monthlyImg = ee.Image.cat(
+          col.select('NDVI').mean().rename('mean_NDVI'),
+          col.select('NDVI').max() .rename('max_NDVI'),
+          col.select('EVI') .mean().rename('mean_EVI'),
+          col.select('EVI') .max() .rename('max_EVI')
+        );
+
+        var statsDict = monthlyImg.reduceRegion({
+          reducer:   ee.Reducer.mean(), // mean over region for each band
+          geometry:  regionGeom,
+          scale:     REDUCE_SCALE,
+          maxPixels: 1e13,
+          tileScale: 4
         });
 
-        // Build NDVI/EVI image collections
-        var ndIC = col.map(ndviFrom);
-        var evIC = col.map(eviFrom);
-
-        // Monthly composites
-        var ndviMeanImg = ndIC.mean();
-        var ndviMaxImg  = ndIC.max();
-        var eviMeanImg  = evIC.mean();
-        var eviMaxImg   = evIC.max();
-
-        // Reductions over region (null if no images)
-        var meanNdvi = ee.Algorithms.If(
-          count.gt(0),
-          ndviMeanImg.reduceRegion({
-            reducer: ee.Reducer.mean(),
-            geometry: regionGeom,
-            scale: 10, maxPixels:1e13, tileScale:4
-          }).get('NDVI'),
-          null
-        );
-        var maxNdvi = ee.Algorithms.If(
-          count.gt(0),
-          ndviMaxImg.reduceRegion({
-            reducer: ee.Reducer.max(),
-            geometry: regionGeom,
-            scale: 10, maxPixels:1e13, tileScale:4
-          }).get('NDVI'),
-          null
-        );
-        var meanEvi = ee.Algorithms.If(
-          count.gt(0),
-          eviMeanImg.reduceRegion({
-            reducer: ee.Reducer.mean(),
-            geometry: regionGeom,
-            scale: 10, maxPixels:1e13, tileScale:4
-          }).get('EVI'),
-          null
-        );
-        var maxEvi = ee.Algorithms.If(
-          count.gt(0),
-          eviMaxImg.reduceRegion({
-            reducer: ee.Reducer.max(),
-            geometry: regionGeom,
-            scale: 10, maxPixels:1e13, tileScale:4
-          }).get('EVI'),
-          null
+        // ---- CLEAR QA from temporal reducers (no per-image loops)
+        var clearImg = ee.Image.cat(
+          col.select('CLEAR').mean().unmask(0).rename('clear_frac_mean'),
+          col.select('CLEAR').max() .unmask(0).rename('clear_frac_max')
         );
 
-        // Clear-sky coverage QA
-        var clearFracMean = ee.Algorithms.If(
-          count.gt(0), colWithCF.aggregate_mean('clearFrac'), null
-        );
-        var clearFracMax = ee.Algorithms.If(
-          count.gt(0), colWithCF.aggregate_max('clearFrac'), null
-        );
+        var clearDict = clearImg.reduceRegion({
+          reducer:   ee.Reducer.mean(),
+          geometry:  regionGeom,
+          scale:     REDUCE_SCALE,
+          maxPixels: 1e13,
+          tileScale: 4
+        });
+
+        // Pull values (null if no images)
+        var meanNdvi = ee.Algorithms.If(count.gt(0), statsDict.get('mean_NDVI'), null);
+        var maxNdvi  = ee.Algorithms.If(count.gt(0), statsDict.get('max_NDVI'),  null);
+        var meanEvi  = ee.Algorithms.If(count.gt(0), statsDict.get('mean_EVI'),  null);
+        var maxEvi   = ee.Algorithms.If(count.gt(0), statsDict.get('max_EVI'),   null);
+
+        var clearFracMean = ee.Algorithms.If(count.gt(0), clearDict.get('clear_frac_mean'), null);
+        var clearFracMax  = ee.Algorithms.If(count.gt(0), clearDict.get('clear_frac_max'),  null);
 
         return ee.Feature(null, {
           ADM2_PCODE:      adm2_code,
-          date:            dateStr,      // first of month
+          date:            dateStr,
           count_images:    count,
-          clear_frac_mean: clearFracMean, // 0..1 (avg fraction of region that was clear)
-          clear_frac_max:  clearFracMax,  // 0..1 (best single-scene coverage)
+          clear_frac_mean: clearFracMean, // 0..1
+          clear_frac_max:  clearFracMax,  // 0..1
           mean_NDVI:       meanNdvi,
           max_NDVI:        maxNdvi,
           mean_EVI:        meanEvi,

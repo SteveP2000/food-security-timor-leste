@@ -1,12 +1,16 @@
 // -----------------------------------------------------------
-// NDVI/EVI peaks, baseline deltas, + ADAPTIVE dynamic viability
-// Updated "GREENER" methodology: only identify INCREASE vs baseline,
-// with both "any-index increase" (OR) and "joint increase" (AND) outputs.
-// Uses HARMONIZED Sentinel-2 SR to ensure consistency across baseline 04.00+
+// NDVI peaks, baseline deltas, + ADAPTIVE dynamic viability (NDVI-only)
+// Memory-lean OPTION A (single export per ADM2):
+//  - Cloudiness prefilter on S2_SR_HARMONIZED
+//  - Smaller percentile sampling & tileScale
+//  - Stronger geometry simplification
+//  - ONE GeoTIFF per ADM2 with COG + tiled writing (fileDimensions)
+//  - All bands cast to Float32 to avoid dtype-mismatch export errors
 // -----------------------------------------------------------
 
 var adm2FC = ee.FeatureCollection(
   'projects/ee-spenson/assets/food-security-timor-leste/LULC_Mean_Probability_Harvest_cropland_mask_adm2_v2'
+//  'projects/ee-spenson/assets/food-security-timor-leste/LULC_Impact_Observatory_cropland_mask_adm2'  
 );
 
 // ===== Parameters =====
@@ -15,46 +19,53 @@ var END_YEAR        = 2025;
 var BASELINE_YEARS  = [2019, 2020, 2021];
 var YEARS           = ee.List.sequence(START_YEAR, END_YEAR);
 
-var EXPORT_SCALE_M  = 20;         // export scale (m)
-var CLD_PROB_THR    = 40;         // S2 cloud probability threshold (0..100)
+var EXPORT_SCALE_M  = 20;   // export scale (m)
+var CLD_PROB_THR    = 40;   // s2cloudless prob threshold (0..100)
 
-// Adaptive viability percentile (per ADM2, baseline-only)
-var VIAB_PERCENTILE = 60;         // try 50–70 depending on strictness
+// Viability percentile (per ADM2, baseline-only)
+var VIAB_PERCENTILE = 60;   // raise to 65–70 if you want stricter viability
 var NDVI_CLAMP_MIN  = 0.35, NDVI_CLAMP_MAX = 0.55;
-var EVI_CLAMP_MIN   = 0.30, EVI_CLAMP_MAX  = 0.50;
 
-// “Greening” = positive anomaly vs baseline
-var CHANGE_THR      = 0.01;       // Δ>0.01 ~ small but real increase
-var PERSIST_MIN_YRS = 2;          // years required (of 2022–2025) for persistent greening
+// Δ detection parameters (σ-based)
+var K_SIGMA         = 1.0;  // try 1.0–1.5
+var DELTA_FLOOR     = 0.01; // floor to suppress tiny numeric noise
 
-var BATCH_SIZE      = 25;         // task batching
+// Observation gating
+var MIN_CNT         = 6;    // min clear observations per year to accept a peak
 
-// ===== S2 preprocessing (join HARMONIZED S2_SR with s2cloudless; SCL + cloud prob masking) =====
+var BATCH_SIZE      = 25;   // task batching
+
+// Percentile sampling knobs (leaner)
+var PCTL_SAMPLE_SCALE = 50;     // 40–60 m
+var PCTL_NUMPIXELS    = 20000;  // smaller sample = less memory
+var PCTL_TILESCALE    = 2;      // lower tileScale => lower per-tile memory
+
+// ===== S2 preprocessing: HARMONIZED SR + robust inner join to s2cloudless =====
 var fullGeom = adm2FC.geometry();
 
-// IMPORTANT: switch to Harmonized collection to avoid the 2022 baseline DN shift
 var s2harm = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterBounds(fullGeom)
-  .filterDate(ee.Date.fromYMD(START_YEAR,1,1), ee.Date.fromYMD(END_YEAR,12,31).advance(1,'day'));
+  .filterDate(ee.Date.fromYMD(START_YEAR,1,1), ee.Date.fromYMD(END_YEAR,12,31).advance(1,'day'))
+  // Cloudiness prefilter removes hopeless scenes before pixel masking:
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 80));
 
 var s2cp  = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
   .filterBounds(fullGeom)
   .filterDate(ee.Date.fromYMD(START_YEAR,1,1), ee.Date.fromYMD(END_YEAR,12,31).advance(1,'day'));
 
-// Join by granule id (system:index matches between S2 and cloud-probability granules)
-var s2_joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply({
+// Inner join ensures every kept S2 scene has a matching cloud-probability granule
+var innerJoined = ee.Join.inner().apply({
   primary: s2harm,
   secondary: s2cp,
-  condition: ee.Filter.equals({
-    leftField: 'system:index',
-    rightField: 'system:index'
-  })
-}));
+  condition: ee.Filter.equals({ leftField: 'system:index', rightField: 'system:index' })
+});
 
-function addCloudProb(img) {
-  var cld = ee.Image(img.get('clouds')).select('probability').rename('MSK_CLDPRB');
-  return img.addBands(cld);
-}
+// Attach MSK_CLDPRB as a band
+var s2_withCP = ee.ImageCollection(innerJoined.map(function (pair) {
+  var s2 = ee.Image(pair.get('primary'));
+  var cp = ee.Image(pair.get('secondary')).select('probability').rename('MSK_CLDPRB');
+  return s2.addBands(cp);
+}));
 
 function maskS2(img) {
   var scl = img.select('SCL');
@@ -63,53 +74,99 @@ function maskS2(img) {
   return img.updateMask(clearSCL).updateMask(clearProb);
 }
 
-// Final S2 collection used downstream
-var s2 = s2_joined
-  .map(addCloudProb)
-  .select(['B8','B4','B2','SCL','MSK_CLDPRB'])
-  .map(maskS2);
-
-// ===== Indices (surface reflectance scaling) =====
-function ndviFrom(img) {
-  var nir = img.select('B8').multiply(0.0001);
-  var red = img.select('B4').multiply(0.0001);
-  return nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-}
-function eviFrom(img) {
+// ----- Precompute NDVI once (post-mask) -----
+function addNDVI(img){
   var nir  = img.select('B8').multiply(0.0001);
   var red  = img.select('B4').multiply(0.0001);
-  var blue = img.select('B2').multiply(0.0001);
-  return nir.subtract(red).multiply(2.5)
-            .divide(nir.add(red.multiply(6)).subtract(blue.multiply(7.5)).add(1))
-            .rename('EVI');
+  var ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+  return img.addBands(ndvi);
 }
+
+// Final collection used downstream: masked S2 → add NDVI
+var s2I = s2_withCP
+  .select(['B8','B4','SCL','MSK_CLDPRB'])
+  .map(maskS2)
+  .map(addNDVI);
+
+// ===== Helpers =====
+function cleanGeom(g) {
+  // Non-zero error margin + stronger simplify to reduce topology complexity
+  return ee.Geometry(g).buffer(0, 1).simplify(60);
+}
+
 function yearCol(y, geom) {
   var start = ee.Date.fromYMD(y, 1, 1);
   var end   = start.advance(1, 'year');
-  return s2.filterDate(start, end).filterBounds(geom);
+  var GG    = cleanGeom(geom);
+  // Clip early to cut work and avoid projection issues at boundaries
+  return s2I.filterDate(start, end).filterBounds(GG)
+            .map(function(img){ return img.clip(GG); });
 }
+
 function safeName(str, maxLen) {
   str = (str || '').toString().replace(/[^A-Za-z0-9_-]/g, '_');
   return (str.length > maxLen) ? str.slice(0, maxLen) : str;
 }
 
-// ===== Build multiband image for one ADM2 (adaptive viability + updated greening) =====
+// Safe constructors for yearly peaks/counts when a year has zero valid scenes
+function safeMaxBand(ic, band, outName){
+  var has = ic.size().gt(0);
+  return ee.Image(ee.Algorithms.If(
+    has, ic.select(band).max().rename(outName),
+    ee.Image.constant(0).rename(outName).updateMask(ee.Image(0)) // fully masked placeholder
+  ));
+}
+function safeCountBand(ic, band, outName){
+  var has = ic.size().gt(0);
+  return ee.Image(ee.Algorithms.If(
+    has, ic.select(band).count().rename(outName),
+    ee.Image.constant(0).rename(outName) // 0 is fine for counts
+  ));
+}
+
+// --- SAMPLE-BASED percentile over a region (lightweight & robust) ---
+// Checks both 'pXX' (sample reduceColumns) and 'band_pXX' (reduceRegion-style) keys.
+function regionPercentile(img, region, p, sampScale, numPix, tileScale) {
+  var band = ee.String(img.bandNames().get(0)); // e.g., 'NDVIp'
+  var GG   = cleanGeom(region);
+
+  var samp = img.sample({
+    region: GG,
+    scale:  sampScale,
+    numPixels: numPix,
+    seed: 1,
+    geometries: false,
+    tileScale: tileScale
+  });
+
+  var hasSamples = samp.size().gt(0);
+  var rawDict = ee.Algorithms.If(
+    hasSamples,
+    samp.reduceColumns(ee.Reducer.percentile([p]), [band]),
+    ee.Dictionary({})
+  );
+  var dict   = ee.Dictionary(rawDict);
+  var key1   = ee.String('p').cat(ee.Number(p).format('%.0f'));      // preferred for sample reduceColumns
+  var key2   = band.cat('_p').cat(ee.Number(p).format('%.0f'));      // fallback if server returns band_pXX
+  var val    = ee.Algorithms.If(dict.contains(key1), dict.get(key1),
+                ee.Algorithms.If(dict.contains(key2), dict.get(key2), null));
+  return val; // may be null
+}
+
+// ===== Build multiband image for one ADM2 (robust baseline + σ-thresholds) =====
 function buildExportImageForADM2(adm2_code) {
   var subset = adm2FC.filter(ee.Filter.eq('ADM2_PCODE', adm2_code));
-  var region = ee.Feature(subset.first()).geometry().simplify(30);
+  var region = cleanGeom(ee.Feature(subset.first()).geometry());
 
-  // --- Step 1: per-year peaks & counts (masked)
+  // --- Step 1: per-year NDVI peaks & counts (using precomputed NDVI)
   var yearlyPeakIC = ee.ImageCollection(
     YEARS.map(function(y) {
       y = ee.Number(y);
-      var col  = yearCol(y, region);
-      var ndIC = col.map(ndviFrom);
-      var evIC = col.map(eviFrom);
-      var ndPeak = ndIC.max().rename('NDVIp');
-      var evPeak = evIC.max().rename('EVIp');
-      var cnt    = ndIC.count().rename('CNT');
-      var idx = ee.String('Y').cat(ee.Number(y).format('%.0f'));
-      return ee.Image.cat(ndPeak, evPeak, cnt)
+      var col    = yearCol(y, region);
+      var ndPeak = safeMaxBand(col, 'NDVI', 'NDVIp');
+      var cnt    = safeCountBand(col, 'NDVI', 'CNT'); // per-pixel # of clear samples
+      var idx    = ee.String('Y').cat(ee.Number(y).format('%.0f'));
+      return ee.Image.cat(ndPeak, cnt)
         .set('year', y)
         .set('system:index', idx)
         .set('system:time_start', ee.Date.fromYMD(y,1,1).millis())
@@ -120,102 +177,62 @@ function buildExportImageForADM2(adm2_code) {
   // --- Step 2: BASELINE images & adaptive viability thresholds (per ADM2)
   var baseIC        = yearlyPeakIC.filter(ee.Filter.inList('year', BASELINE_YEARS));
   var maxNDVI_base  = baseIC.select('NDVIp').max();
-  var maxEVI_base   = baseIC.select('EVIp').max();
 
-  // Safe percentile reduction with fallback
-  var p        = VIAB_PERCENTILE;
-  var pReducer = ee.Reducer.percentile([p]);
+  // Sample-based percentile (lean)
+  var pVal = regionPercentile(maxNDVI_base, region, VIAB_PERCENTILE,
+                              PCTL_SAMPLE_SCALE, PCTL_NUMPIXELS, PCTL_TILESCALE);
+  var ndviThr0 = ee.Algorithms.If(pVal, pVal, NDVI_CLAMP_MIN);
+  var ndviThr  = ee.Number(ndviThr0).max(NDVI_CLAMP_MIN).min(NDVI_CLAMP_MAX);
 
-  var ndviDict = maxNDVI_base.reduceRegion({
-    reducer: pReducer, geometry: region, scale: 20, maxPixels: 1e13, bestEffort: true, tileScale: 4
-  });
-  var eviDict  = maxEVI_base.reduceRegion({
-    reducer: pReducer, geometry: region, scale: 20, maxPixels: 1e13, bestEffort: true, tileScale: 4
-  });
-
-  var ndviBand = ee.String(maxNDVI_base.bandNames().get(0));  // 'NDVIp'
-  var eviBand  = ee.String(maxEVI_base.bandNames().get(0));   // 'EVIp'
-  var pStr     = ee.Number(p).format('%.0f');
-  var ndviKey  = ndviBand.cat('_p').cat(pStr);
-  var eviKey   = eviBand .cat('_p').cat(pStr);
-
-  var ndviThr0 = ee.Algorithms.If(ee.Dictionary(ndviDict).contains(ndviKey),
-                                  ee.Dictionary(ndviDict).get(ndviKey), NDVI_CLAMP_MIN);
-  var eviThr0  = ee.Algorithms.If(ee.Dictionary(eviDict).contains(eviKey),
-                                  ee.Dictionary(eviDict).get(eviKey), EVI_CLAMP_MIN);
-
-  var ndviThr = ee.Number(ndviThr0).max(NDVI_CLAMP_MIN).min(NDVI_CLAMP_MAX);
-  var eviThr  = ee.Number(eviThr0 ).max(EVI_CLAMP_MIN ).min(EVI_CLAMP_MAX );
-
-  // --- Step 3: DYNAMIC VIABILITY MASK (baseline-only, adaptive)
+  // --- Step 3: DYNAMIC VIABILITY MASK (baseline-only, NDVI-only)
   var polyMask   = ee.Image().byte().paint(subset, 1).selfMask();
-  var viableMask = maxNDVI_base.gte(ndviThr).or(maxEVI_base.gte(eviThr));
-  var cropMask   = polyMask.updateMask(viableMask).rename('VIABLE_MASK');
+  var viableMask = maxNDVI_base.gte(ndviThr);
+  var cropMask   = polyMask.updateMask(viableMask).rename('VIABLE_MASK'); // Byte internally
 
-  // --- Step 4: Baselines (mean peaks over 2019–2021)
-  var ndviBase = baseIC.select('NDVIp').mean().rename('NDVIp_base').toFloat();
-  var eviBase  = baseIC.select('EVIp').mean().rename('EVIp_base').toFloat();
+  // --- Step 4: Robust BASELINE = MEDIAN of NDVI peaks over 2019–2021
+  var ndviBase = baseIC.select('NDVIp').median().rename('NDVIp_base'); // Float32 later
 
-  // --- Step 5: Deltas vs baseline (per year)
+  // Baseline variability (σ) for σ-based Δ thresholds with safe fallback
+  var ndSigma   = baseIC.select('NDVIp').reduce(ee.Reducer.stdDev()).rename('NDVIp_sd');
+  var ndThrImg  = ndSigma.multiply(K_SIGMA).where(ndSigma.lte(0), DELTA_FLOOR).max(DELTA_FLOOR);
+
+  // --- Step 5: Deltas vs median baseline (per year)
   var deltaIC = yearlyPeakIC.map(function(img) {
-    var dNdvi = img.select('NDVIp').subtract(ndviBase).rename('dNDVI');
-    var dEvi  = img.select('EVIp').subtract(eviBase).rename('dEVI');
-    return ee.Image.cat(dNdvi, dEvi).set('system:index', img.get('system:index'));
+    var dNdvi = img.select('NDVIp').subtract(ndviBase).rename('dNDVI'); // Float32 later
+    return ee.Image.cat(dNdvi, img.select('CNT')).set('system:index', img.get('system:index'));
   });
 
   // --- Step 6: Stacks (masked to dynamic viable cropland)
-  var ndviPeakBands = yearlyPeakIC.select('NDVIp').toBands().updateMask(cropMask).toFloat();
-  var eviPeakBands  = yearlyPeakIC.select('EVIp').toBands().updateMask(cropMask).toFloat();
-  var cntBands      = yearlyPeakIC.select('CNT').toBands().updateMask(cropMask).toFloat();
-  var dNdviBands    = deltaIC.select('dNDVI').toBands().updateMask(cropMask).toFloat();
-  var dEviBands     = deltaIC.select('dEVI').toBands().updateMask(cropMask).toFloat();
+  var ndviPeakBands = yearlyPeakIC.select('NDVIp').toBands().updateMask(cropMask);
+  var cntBands      = yearlyPeakIC.select('CNT'  ).toBands().updateMask(cropMask);
+  var dNdviBands    = deltaIC     .select('dNDVI').toBands().updateMask(cropMask);
 
-  // --- Step 7: Greening masks = INCREASE ONLY
-  // Any-index increase (OR) and joint increase (AND)
-  function greenYear_any(y) {
-    var ys = 'Y' + y;
-    var inc = dEviBands.select(ys + '_dEVI').gt(CHANGE_THR)
-               .or(dNdviBands.select(ys + '_dNDVI').gt(CHANGE_THR));
-    return inc.updateMask(cropMask).rename(ys + '_GREEN_inc_any').toFloat();
-  }
-  function greenYear_both(y) {
-    var ys = 'Y' + y;
-    var inc = dEviBands.select(ys + '_dEVI').gt(CHANGE_THR)
-               .and(dNdviBands.select(ys + '_dNDVI').gt(CHANGE_THR));
-    return inc.updateMask(cropMask).rename(ys + '_GREEN_inc_both').toFloat();
+  // --- Step 7: Greening masks = INCREASE ONLY (NDVI) with σ-thresholds + MIN_CNT gating
+  function greenYear_ndvi(y) {
+    var ys   = 'Y' + y;
+    var cntOk = cntBands.select(ys + '_CNT').gte(MIN_CNT);
+    var inc  = dNdviBands.select(ys + '_dNDVI').gt(ndThrImg).and(cntOk);
+    return inc.updateMask(cropMask).rename(ys + '_GREEN_inc_ndvi');
   }
 
-  var g22_any = greenYear_any(2022), g23_any = greenYear_any(2023),
-      g24_any = greenYear_any(2024), g25_any = greenYear_any(2025);
+  var g22 = greenYear_ndvi(2022), g23 = greenYear_ndvi(2023),
+      g24 = greenYear_ndvi(2024), g25 = greenYear_ndvi(2025);
 
-  var g22_both = greenYear_both(2022), g23_both = greenYear_both(2023),
-      g24_both = greenYear_both(2024), g25_both = greenYear_both(2025);
+  var any_ndvi     = g22.add(g23).add(g24).add(g25).gt(0).rename('GREEN_any_2022_2025_inc_ndvi');
+  var persist_ndvi = g22.add(g23).add(g24).add(g25).gte(2).rename('GREEN_persist_ge2_2022_2025_inc_ndvi');
 
-  var any_any     = g22_any.add(g23_any).add(g24_any).add(g25_any)
-                     .gt(0).rename('GREEN_any_2022_2025_inc_any').toFloat();
-  var persist_any = g22_any.add(g23_any).add(g24_any).add(g25_any)
-                     .gte(PERSIST_MIN_YRS).rename('GREEN_persist_ge2_2022_2025_inc_any').toFloat();
+  // --- Step 8: Final multiband image — cast ALL to Float32 to ensure compatible dtypes
+  var outImg = ee.Image.cat(
+                 ndviPeakBands,        // per-year NDVI peaks
+                 cntBands,             // per-year counts
+                 ndviBase,             // baseline median
+                 dNdviBands,           // per-year deltas
+                 ee.Image(cropMask).rename('VIABLE_MASK'), // mask
+                 ee.Image.cat([g22, g23, g24, g25, any_ndvi, persist_ndvi])
+               ).toFloat()             // <-- enforce uniform dtype
+               .clip(region);
 
-  var any_both     = g22_both.add(g23_both).add(g24_both).add(g25_both)
-                      .gt(0).rename('GREEN_any_2022_2025_inc_both').toFloat();
-  var persist_both = g22_both.add(g23_both).add(g24_both).add(g25_both)
-                      .gte(PERSIST_MIN_YRS).rename('GREEN_persist_ge2_2022_2025_inc_both').toFloat();
-
-  var masks = ee.Image.cat([
-    cropMask,                          // VIABLE_MASK
-    g22_any, g23_any, g24_any, g25_any,
-    g22_both, g23_both, g24_both, g25_both,
-    any_any,  persist_any,
-    any_both, persist_both
-  ]).toFloat();
-
-  // --- Step 8: Final multiband image
-  return ee.Image.cat(
-           ndviPeakBands, eviPeakBands, cntBands,
-           ndviBase, eviBase,
-           dNdviBands, dEviBands,
-           masks
-         ).clip(region).toFloat();
+  return outImg;
 }
 
 // ===== Queue tasks (batched) =====
@@ -227,14 +244,15 @@ adm2FC.aggregate_array('ADM2_PCODE').evaluate(function(codes) {
     var batch = codes.slice(i, Math.min(i + BATCH_SIZE, codes.length));
     batch.forEach(function(codeRaw) {
       var code   = safeName(codeRaw, 40);
-      var desc   = safeName('NDVI_EVI_GREEN_INCREASE_' + code, 60);
-      var fn     = safeName(code + '_NDVI_EVI_GREEN_INCREASE_2019_2025_20m', 80);
+      var desc   = safeName('NDVI_GREEN_INCREASE_' + code, 60);
+      var fn     = safeName(code + '_NDVI_GREEN_INCREASE_2019_2025_20m', 80);
+
+      var feat   = adm2FC.filter(ee.Filter.eq('ADM2_PCODE', codeRaw)).first();
+      var region = cleanGeom(ee.Feature(feat).geometry());
 
       var outImg = buildExportImageForADM2(codeRaw);
-      var region = adm2FC.filter(ee.Filter.eq('ADM2_PCODE', codeRaw))
-                         .geometry()
-                         .simplify(30);
 
+      // --- Export to Drive (single tiled GeoTIFF, COG)
       Export.image.toDrive({
         image:          outImg,
         description:    desc,
@@ -242,7 +260,11 @@ adm2FC.aggregate_array('ADM2_PCODE').evaluate(function(codes) {
         folder:         'NDVI_Change_TIMOR_ADM2',
         region:         region,
         scale:          EXPORT_SCALE_M,
-        maxPixels:      1e13
+        maxPixels:      1e13,
+        fileFormat:     'GeoTIFF',
+        fileDimensions: 8192,              // tile the output to reduce memory
+        skipEmptyTiles: true,              // don’t write fully masked tiles
+        formatOptions:  { cloudOptimized: true } // write a COG
       });
     });
     print('Queued batch', (i / BATCH_SIZE) + 1, 'with', batch.length, 'tasks.');
