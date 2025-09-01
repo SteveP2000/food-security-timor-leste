@@ -12,10 +12,10 @@ var HARVEST_START = 4;  // April
 var HARVEST_END   = 7;  // July
 var harvestMonths = ee.List.sequence(HARVEST_START, HARVEST_END);
 
-var START = ee.Date('2019-01-01');
+var START = ee.Date('2019jupyter -01-01');
 var END   = ee.Date('2025-12-31');
 
-var CLD_PROB_THR = 40;  // s2cloudless threshold (0..100)
+var CLD_PROB_THR = 40;
 
 // ------------------ 2) Class names & palette ------------------
 var CLASS_NAMES = [
@@ -132,9 +132,9 @@ for (var i = 0; i < n; i++) {
   print(code, 'harvest DW images (after mask):', imgCount);
 
   // (c) Mean‑probability across harvest months (per pixel)
-  var countImg = dwMasked.select('water').count();        // valid obs count
+  var countImg = dwMasked.select('water').count();
   var sumProb  = dwMasked.select(CLASS_NAMES).reduce(ee.Reducer.sum());
-  var meanProb = sumProb.divide(countImg.max(1));         // avoid div/0; zero‑count stays masked
+  var meanProb = sumProb.divide(countImg.max(1));
 
   // (d) Argmax → label 0..8
   var labelMap = meanProb

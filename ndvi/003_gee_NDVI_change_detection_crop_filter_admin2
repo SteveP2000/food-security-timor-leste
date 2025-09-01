@@ -2,8 +2,6 @@
 // NDVI peaks, baseline deltas, + ADAPTIVE dynamic viability (NDVI-only)
 // Memory-lean OPTION A (single export per ADM2):
 //  - Cloudiness prefilter on S2_SR_HARMONIZED
-//  - Smaller percentile sampling & tileScale
-//  - Stronger geometry simplification
 //  - ONE GeoTIFF per ADM2 with COG + tiled writing (fileDimensions)
 //  - All bands cast to Float32 to avoid dtype-mismatch export errors
 // -----------------------------------------------------------
@@ -23,11 +21,11 @@ var EXPORT_SCALE_M  = 20;   // export scale (m)
 var CLD_PROB_THR    = 40;   // s2cloudless prob threshold (0..100)
 
 // Viability percentile (per ADM2, baseline-only)
-var VIAB_PERCENTILE = 60;   // raise to 65–70 if you want stricter viability
+var VIAB_PERCENTILE = 60;
 var NDVI_CLAMP_MIN  = 0.35, NDVI_CLAMP_MAX = 0.55;
 
 // Δ detection parameters (σ-based)
-var K_SIGMA         = 1.0;  // try 1.0–1.5
+var K_SIGMA         = 1.0;
 var DELTA_FLOOR     = 0.01; // floor to suppress tiny numeric noise
 
 // Observation gating
@@ -113,14 +111,14 @@ function safeMaxBand(ic, band, outName){
   var has = ic.size().gt(0);
   return ee.Image(ee.Algorithms.If(
     has, ic.select(band).max().rename(outName),
-    ee.Image.constant(0).rename(outName).updateMask(ee.Image(0)) // fully masked placeholder
+    ee.Image.constant(0).rename(outName).updateMask(ee.Image(0))
   ));
 }
 function safeCountBand(ic, band, outName){
   var has = ic.size().gt(0);
   return ee.Image(ee.Algorithms.If(
     has, ic.select(band).count().rename(outName),
-    ee.Image.constant(0).rename(outName) // 0 is fine for counts
+    ee.Image.constant(0).rename(outName)
   ));
 }
 
@@ -187,10 +185,10 @@ function buildExportImageForADM2(adm2_code) {
   // --- Step 3: DYNAMIC VIABILITY MASK (baseline-only, NDVI-only)
   var polyMask   = ee.Image().byte().paint(subset, 1).selfMask();
   var viableMask = maxNDVI_base.gte(ndviThr);
-  var cropMask   = polyMask.updateMask(viableMask).rename('VIABLE_MASK'); // Byte internally
+  var cropMask   = polyMask.updateMask(viableMask).rename('VIABLE_MASK');
 
   // --- Step 4: Robust BASELINE = MEDIAN of NDVI peaks over 2019–2021
-  var ndviBase = baseIC.select('NDVIp').median().rename('NDVIp_base'); // Float32 later
+  var ndviBase = baseIC.select('NDVIp').median().rename('NDVIp_base');
 
   // Baseline variability (σ) for σ-based Δ thresholds with safe fallback
   var ndSigma   = baseIC.select('NDVIp').reduce(ee.Reducer.stdDev()).rename('NDVIp_sd');
@@ -198,7 +196,7 @@ function buildExportImageForADM2(adm2_code) {
 
   // --- Step 5: Deltas vs median baseline (per year)
   var deltaIC = yearlyPeakIC.map(function(img) {
-    var dNdvi = img.select('NDVIp').subtract(ndviBase).rename('dNDVI'); // Float32 later
+    var dNdvi = img.select('NDVIp').subtract(ndviBase).rename('dNDVI');
     return ee.Image.cat(dNdvi, img.select('CNT')).set('system:index', img.get('system:index'));
   });
 
@@ -229,7 +227,7 @@ function buildExportImageForADM2(adm2_code) {
                  dNdviBands,           // per-year deltas
                  ee.Image(cropMask).rename('VIABLE_MASK'), // mask
                  ee.Image.cat([g22, g23, g24, g25, any_ndvi, persist_ndvi])
-               ).toFloat()             // <-- enforce uniform dtype
+               ).toFloat()
                .clip(region);
 
   return outImg;
@@ -262,8 +260,8 @@ adm2FC.aggregate_array('ADM2_PCODE').evaluate(function(codes) {
         scale:          EXPORT_SCALE_M,
         maxPixels:      1e13,
         fileFormat:     'GeoTIFF',
-        fileDimensions: 8192,              // tile the output to reduce memory
-        skipEmptyTiles: true,              // don’t write fully masked tiles
+        fileDimensions: 8192,
+        skipEmptyTiles: true,
         formatOptions:  { cloudOptimized: true } // write a COG
       });
     });

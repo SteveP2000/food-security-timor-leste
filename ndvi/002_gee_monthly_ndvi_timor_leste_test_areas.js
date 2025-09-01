@@ -24,7 +24,7 @@ var regionGeom = aoiFC.geometry();
 
 var START_YEAR = 2019;
 var END_YEAR   = 2025;
-var CLD_PROB_THR = 40; // consistent with v2/script 3
+var CLD_PROB_THR = 40;
 
 // 1) Sentinel-2: join Harmonized S2_SR with s2cloudless and build CLEAR mask via SCL + prob
 var s2harmSR = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -170,10 +170,10 @@ var metrics = ee.FeatureCollection(
 
     return ee.Feature(null, {
       region_name:     REGION_NAME,
-      date:            dateStr,       // first of month
+      date:            dateStr,
       count_images:    count,
-      clear_frac_mean: clearFracMean, // 0..1 (avg fraction of region that was clear)
-      clear_frac_max:  clearFracMax,  // 0..1 (best single-scene coverage)
+      clear_frac_mean: clearFracMean,
+      clear_frac_max:  clearFracMax,
       mean_NDVI:       meanNdvi,
       max_NDVI:        maxNdvi,
       mean_EVI:        meanEvi,
@@ -185,7 +185,7 @@ var metrics = ee.FeatureCollection(
 // 4) Export a single CSV (task name uses the asset's base name)
 Export.table.toDrive({
   collection:     metrics,
-  description:    'Metrics_admn2_' + REGION_NAME, // exactly: Metrics_admn2_seloi_craic_rice_agricultural_area
+  description:    'Metrics_admn2_' + REGION_NAME,
   fileNamePrefix: REGION_NAME + '_NDVI_EVI_monthly',
   folder:         'EarthEngineExports_NDVI_EVI',
   fileFormat:     'CSV',
@@ -202,6 +202,6 @@ Export.table.toDrive({
   ]
 });
 
-// Optional: quick map cue
+// Quick map cue
 Map.centerObject(aoiFC, 12);
 Map.addLayer(aoiFC, {color: 'yellow'}, 'AOI');

@@ -12,8 +12,8 @@ var adm2FC = ee.FeatureCollection(
 );
 var START_YEAR = 2019;
 var END_YEAR   = 2025;
-var CLD_PROB_THR = 40;     // consistent with Script 3
-var REDUCE_SCALE = 20;     // faster + consistent with SCL native resolution
+var CLD_PROB_THR = 40;
+var REDUCE_SCALE = 20;
 
 // 1) Sentinel-2: robust inner join (every image has cloud prob)
 var s2harmSR = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -103,7 +103,7 @@ adm2FC.aggregate_array('ADM2_PCODE').evaluate(function(codes) {
         );
 
         var statsDict = monthlyImg.reduceRegion({
-          reducer:   ee.Reducer.mean(), // mean over region for each band
+          reducer:   ee.Reducer.mean(),
           geometry:  regionGeom,
           scale:     REDUCE_SCALE,
           maxPixels: 1e13,

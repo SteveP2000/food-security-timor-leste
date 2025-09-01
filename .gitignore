@@ -57,3 +57,6 @@ rsconnect/
 
 # Ignore Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+/jupyter/_archive/
+/ndvi/_archive/

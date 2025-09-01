@@ -28,7 +28,7 @@ var EXPORT_SCALE_M  = 20;         // export scale (m)
 var CLD_PROB_THR    = 40;         // S2 cloud probability threshold (0..100)
 
 // Adaptive viability percentile (per AOI, baseline-only)
-var VIAB_PERCENTILE = 60;         // try 50–70 depending on strictness
+var VIAB_PERCENTILE = 60;
 var NDVI_CLAMP_MIN  = 0.35, NDVI_CLAMP_MAX = 0.55;
 var EVI_CLAMP_MIN   = 0.30, EVI_CLAMP_MAX  = 0.50;
 
@@ -220,14 +220,14 @@ var outImg = buildExportImageForAOI(REGION);
 
 Export.image.toDrive({
   image:          outImg,
-  description:    REGION_NAME,  // exact task name: "seloi_craic_rice_agricultural_area"
+  description:    REGION_NAME,
   fileNamePrefix: REGION_NAME + '_NDVI_EVI_GREEN_INCREASE_2019_2025_20m',
-  folder:         'NDVI_Change_TIMOR_ADM2', // keep your existing folder (change if you prefer)
+  folder:         'NDVI_Change_TIMOR_ADM2',
   region:         REGION,
   scale:          EXPORT_SCALE_M,
   maxPixels:      1e13
 });
 
-// Optional map cues
+// Map cues
 Map.centerObject(aoiFC, 13);
 Map.addLayer(aoiFC, {color: 'yellow'}, 'AOI');
